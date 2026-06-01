@@ -1095,19 +1095,15 @@ async def do_manage_endpoints(content: str, owner: Optional[str] = None) -> Dict
 # Allowlist of executables that may be spawned for stdio MCP servers. Anything
 # not on this list, or any absolute path that resolves outside the project
 # root, is rejected by _validate_mcp_command before the subprocess is spawned.
-# This blocks the manage_mcp-RCE pattern where the LLM/UI could pass an
-# arbitrary `command` (e.g. "sh") and `args` (e.g. ["-c", "id"]) and get
-# arbitrary code execution as the app's UID.
 import pathlib
 _MCP_ALLOWED_COMMANDS = frozenset({
-    "python3", "python", "node", "deno", "bun",
-    "uv", "uvx", "pipx",
-    "npm", "npx", "pnpm", "yarn",
+    "python3", "python", "node", "deno", "bun", "uv",
 })
-# env var names that a child process must NOT be allowed to override. Allowing
-# any of these would let a poisoned env entry redirect the interpreter's
-# module search, preload a shared library, or change which executable `bash`
-# resolves to.
+# Package runners (npx, uvx, pipx, npm, pnpm, yarn) are intentionally
+# excluded: they can download and execute arbitrary remote packages, which is
+# the same RCE surface we are closing.  If a package is needed, install it
+# into the project venv and invoke it via the interpreter or a project-local
+# script.
 _MCP_FORBIDDEN_ENV_KEYS = frozenset({
     k.lower() for k in (
         "LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT",
@@ -1116,13 +1112,13 @@ _MCP_FORBIDDEN_ENV_KEYS = frozenset({
         "DYLD_INSERT_LIBRARIES", "DYLD_LIBRARY_PATH",
     )
 })
-# args[0] patterns that turn an interpreter into a one-shot shell. Refused
-# when the resolved command is one of the interpreters above, because they
-# can execute attacker-controlled strings the same way `sh -c` does.
 _MCP_INTERPRETER_SHELL_ESCAPE_FLAGS = frozenset({
     "-c", "-e", "--eval", "-r", "-e=", "--eval=", "-r=",
     "/c",  # Windows cmd
 })
+# URL schemes that signal a remote fetch — if any arg starts with one of
+# these, the command would download and execute remote code.
+_MCP_REMOTE_URL_SCHEMES = frozenset({"http://", "https://", "ftp://", "file://"})
 
 
 def _validate_mcp_command(command: str, cmd_args, env) -> Optional[str]:
@@ -1179,13 +1175,17 @@ def _validate_mcp_command(command: str, cmd_args, env) -> Optional[str]:
         if not isinstance(a, str):
             return f"args[{i}] must be a string (got {type(a).__name__})"
     if is_path or os.path.basename(cmd) in _MCP_ALLOWED_COMMANDS:
-        # Only enforce on interpreter-style commands; for project-relative
-        # scripts the caller already controls what gets executed.
         if any(a in _MCP_INTERPRETER_SHELL_ESCAPE_FLAGS for a in cmd_args):
             return (f"args contain a shell-escape flag "
                     f"({sorted(_MCP_INTERPRETER_SHELL_ESCAPE_FLAGS)}); "
                     f"these are not allowed for stdio MCP servers because "
                     f"they turn the interpreter into a one-shot shell")
+    # Reject any arg that looks like a remote URL — deno/bun/node can all
+    # fetch and execute remote scripts via URL args.
+    for a in cmd_args:
+        if any(a.lower().startswith(s) for s in _MCP_REMOTE_URL_SCHEMES):
+            return (f"arg contains a remote URL ({a!r}); "
+                    f"stdio MCP servers must not fetch remote code")
 
     # Env: must be a flat dict of str->str; no forbidden keys.
     if env is None:
