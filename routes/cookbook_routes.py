@@ -427,21 +427,10 @@ def setup_cookbook_routes() -> APIRouter:
         # activated venv. Local bash runs only — meaningless over SSH/Windows.
         if not req.remote_host and req.platform != "windows":
             lines.append(_local_tooling_path_export(sys.executable))
-        # Best-effort install hf CLI (always). hf_transfer (Rust parallel downloader)
-        # is fast but flaky on large files — it tends to crash near the end at high
-        # throughput. Retries set disable_hf_transfer to fall back to the plain,
-        # slower-but-reliable downloader (resumes cleanly from the .incomplete files).
-        # Use `python3 -m pip` not `pip` — macOS has no bare `pip` command.
-        # IMPORTANT: in an active venv, `pip install --user` fails with
-        # "User site-packages are not visible in this virtualenv." — so try the
-        # plain install first and only reach for `--user --break-system-packages`
-        # outside a venv.
-        #
-        # PIP EXIT STATUS: previous version piped through `| tail -5`, which
-        # masks pip's exit code (the pipeline returns tail's 0 even when pip
-        # fails, so the `||` fallback chain never fires). Now each attempt
-        # captures output to a temp file, prints the tail on failure, and
-        # returns pip's real exit status. See PR #363 review feedback.
+        # Best-effort install hf CLI. Try plain pip first (venv-safe), fall back
+        # to --user --break-system-packages outside venvs. Each attempt captures
+        # output to a temp file and returns pip's real exit code so the || chain
+        # actually fires on failure (| tail would mask it).
         _pip_install_hf = (
             "_pip_out=$(mktemp) && "
             "python3 -m pip install -q -U huggingface_hub >\"$_pip_out\" 2>&1; _pip_ec=$?; "
