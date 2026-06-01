@@ -435,26 +435,61 @@ def setup_cookbook_routes() -> APIRouter:
         # IMPORTANT: in an active venv, `pip install --user` fails with
         # "User site-packages are not visible in this virtualenv." — so try the
         # plain install first and only reach for `--user --break-system-packages`
-        # outside a venv. We also drop the blanket `2>/dev/null` so any residual
-        # failure surfaces in the tmux log and the user can debug it (issue #354).
+        # outside a venv.
+        #
+        # PIP EXIT STATUS: previous version piped through `| tail -5`, which
+        # masks pip's exit code (the pipeline returns tail's 0 even when pip
+        # fails, so the `||` fallback chain never fires). Now each attempt
+        # captures output to a temp file, prints the tail on failure, and
+        # returns pip's real exit status. See PR #363 review feedback.
+        _pip_install_hf = (
+            "_pip_out=$(mktemp) && "
+            "python3 -m pip install -q -U huggingface_hub >\"$_pip_out\" 2>&1; _pip_ec=$?; "
+            "tail -5 \"$_pip_out\"; rm -f \"$_pip_out\"; exit $_pip_ec"
+        )
+        _pip_install_hf_user = (
+            "_pip_out=$(mktemp) && "
+            "python3 -m pip install --user --break-system-packages -q -U huggingface_hub >\"$_pip_out\" 2>&1; _pip_ec=$?; "
+            "tail -5 \"$_pip_out\"; rm -f \"$_pip_out\"; exit $_pip_ec"
+        )
+        _pip_install_hf_bare = (
+            "_pip_out=$(mktemp) && "
+            "python3 -m pip install --break-system-packages -q -U huggingface_hub >\"$_pip_out\" 2>&1; _pip_ec=$?; "
+            "tail -5 \"$_pip_out\"; rm -f \"$_pip_out\"; exit $_pip_ec"
+        )
         _install_hf_cmd = (
             "command -v hf >/dev/null 2>&1 || "
             "{ [ -n \"${VIRTUAL_ENV:-}${CONDA_PREFIX:-}\" ] && "
-            "python3 -m pip install -q -U huggingface_hub 2>&1 | tail -5 || "
-            "python3 -m pip install --user --break-system-packages -q -U huggingface_hub 2>&1 | tail -5 || "
-            "python3 -m pip install --break-system-packages -q -U huggingface_hub 2>&1 | tail -5; }"
+            f"bash -c '{_pip_install_hf}' || "
+            f"bash -c '{_pip_install_hf_user}' || "
+            f"bash -c '{_pip_install_hf_bare}'; }}"
         )
         lines.append(_install_hf_cmd)
         if req.disable_hf_transfer:
             lines.append("export HF_HUB_ENABLE_HF_TRANSFER=0")
             lines.append("export HF_HUB_DOWNLOAD_MAX_WORKERS=4")
         else:
+            _pip_install_hft = (
+                "_pip_out=$(mktemp) && "
+                "python3 -m pip install -q hf_transfer >\"$_pip_out\" 2>&1; _pip_ec=$?; "
+                "tail -5 \"$_pip_out\"; rm -f \"$_pip_out\"; exit $_pip_ec"
+            )
+            _pip_install_hft_user = (
+                "_pip_out=$(mktemp) && "
+                "python3 -m pip install --user --break-system-packages -q hf_transfer >\"$_pip_out\" 2>&1; _pip_ec=$?; "
+                "tail -5 \"$_pip_out\"; rm -f \"$_pip_out\"; exit $_pip_ec"
+            )
+            _pip_install_hft_bare = (
+                "_pip_out=$(mktemp) && "
+                "python3 -m pip install --break-system-packages -q hf_transfer >\"$_pip_out\" 2>&1; _pip_ec=$?; "
+                "tail -5 \"$_pip_out\"; rm -f \"$_pip_out\"; exit $_pip_ec"
+            )
             _install_hft_cmd = (
                 "python3 -c 'import hf_transfer' 2>/dev/null || "
                 "{ [ -n \"${VIRTUAL_ENV:-}${CONDA_PREFIX:-}\" ] && "
-                "python3 -m pip install -q hf_transfer 2>&1 | tail -5 || "
-                "python3 -m pip install --user --break-system-packages -q hf_transfer 2>&1 | tail -5 || "
-                "python3 -m pip install --break-system-packages -q hf_transfer 2>&1 | tail -5; }"
+                f"bash -c '{_pip_install_hft}' || "
+                f"bash -c '{_pip_install_hft_user}' || "
+                f"bash -c '{_pip_install_hft_bare}'; }}"
             )
             lines.append(_install_hft_cmd)
             lines.append("python3 -c 'import hf_transfer' 2>/dev/null && export HF_HUB_ENABLE_HF_TRANSFER=1")
