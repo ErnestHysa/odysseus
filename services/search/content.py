@@ -7,10 +7,12 @@ import os
 import re
 import logging
 import socket
+import typing
 from datetime import datetime, timedelta
 from typing import List
 from urllib.parse import urljoin, urlparse
 
+import httpcore
 import httpx
 from bs4 import BeautifulSoup
 
@@ -78,12 +80,84 @@ def _public_http_url(url: str) -> bool:
         return False
 
 
+def _resolve_public_ips(url: str) -> List[ipaddress._BaseAddress]:
+    """Resolve a URL's hostname to public IPs. Rejects private targets."""
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise httpx.RequestError(f"Blocked non-HTTP(S) URL: {url}")
+    host = parsed.hostname.strip().lower()
+    if host in ("localhost", "metadata.google.internal", "metadata"):
+        raise httpx.RequestError(f"Blocked metadata hostname: {host}")
+    if host.endswith((".local", ".localhost", ".internal", ".lan", ".intranet")):
+        raise httpx.RequestError(f"Blocked internal hostname: {host}")
+    try:
+        ip = ipaddress.ip_address(host)
+        if _is_private_address(ip):
+            raise httpx.RequestError(f"Blocked private IP: {host}")
+        return [ip]
+    except httpx.RequestError:
+        raise
+    except ValueError:
+        pass
+    ips = _resolve_hostname_ips(host)
+    if not ips or any(_is_private_address(ip) for ip in ips):
+        raise httpx.RequestError(f"Blocked non-public URL: {url}")
+    return ips
+
+
+class _PinnedBackend(httpcore.NetworkBackend):
+    """Overrides connect_tcp to connect to a pre-resolved IP. TLS/SNI
+    and Host headers stay derived from the original URL hostname."""
+
+    def __init__(self, ip: ipaddress._BaseAddress):
+        self._ip = str(ip)
+        self._real = httpcore.SyncBackend()
+
+    def connect_tcp(self, host: str, port: int,
+                    timeout: float | None = None,
+                    local_address: str | None = None,
+                    socket_options: typing.Any = None):
+        return self._real.connect_tcp(
+            self._ip, port, timeout, local_address, socket_options,
+        )
+
+    def connect_unix_socket(self, path: str,
+                            timeout: float | None = None,
+                            socket_options: typing.Any = None):
+        return self._real.connect_unix_socket(path, timeout, socket_options)
+
+    def sleep(self, seconds: float) -> None:
+        return self._real.sleep(seconds)
+
+
+class _PinnedTransport(httpx.HTTPTransport):
+    """HTTPTransport that pins TCP connections to a given IP."""
+
+    def __init__(self, ip: ipaddress._BaseAddress, **kw):
+        super().__init__(**kw)
+        orig = self._pool
+        self._pool = httpcore.ConnectionPool(
+            ssl_context=orig._ssl_context,
+            max_connections=orig._max_connections,
+            max_keepalive_connections=orig._max_keepalive_connections,
+            keepalive_expiry=orig._keepalive_expiry,
+            http1=orig._http1,
+            http2=orig._http2,
+            network_backend=_PinnedBackend(ip),
+        )
+        orig.close()
+
+
 def _get_public_url(url: str, headers: dict, timeout: int, max_redirects: int = 5) -> httpx.Response:
     current = url
     for _ in range(max_redirects + 1):
-        if not _public_http_url(current):
-            raise httpx.RequestError("Blocked private/internal URL", request=httpx.Request("GET", current))
-        response = httpx.get(current, headers=headers, timeout=timeout, follow_redirects=False)
+        ips = _resolve_public_ips(current)
+        with httpx.Client(
+            headers=headers, timeout=timeout,
+            follow_redirects=False,
+            transport=_PinnedTransport(ips[0]),
+        ) as client:
+            response = client.get(current)
         if response.status_code not in (301, 302, 303, 307, 308):
             return response
         location = response.headers.get("location")
