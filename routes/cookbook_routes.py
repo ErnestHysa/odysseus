@@ -432,12 +432,31 @@ def setup_cookbook_routes() -> APIRouter:
         # throughput. Retries set disable_hf_transfer to fall back to the plain,
         # slower-but-reliable downloader (resumes cleanly from the .incomplete files).
         # Use `python3 -m pip` not `pip` — macOS has no bare `pip` command.
-        lines.append("command -v hf >/dev/null 2>&1 || python3 -m pip install --user --break-system-packages -q -U huggingface_hub 2>/dev/null || python3 -m pip install -q -U huggingface_hub 2>/dev/null")
+        # IMPORTANT: in an active venv, `pip install --user` fails with
+        # "User site-packages are not visible in this virtualenv." — so try the
+        # plain install first and only reach for `--user --break-system-packages`
+        # outside a venv. We also drop the blanket `2>/dev/null` so any residual
+        # failure surfaces in the tmux log and the user can debug it (issue #354).
+        _install_hf_cmd = (
+            "command -v hf >/dev/null 2>&1 || "
+            "{ [ -n \"${VIRTUAL_ENV:-}${CONDA_PREFIX:-}\" ] && "
+            "python3 -m pip install -q -U huggingface_hub 2>&1 | tail -5 || "
+            "python3 -m pip install --user --break-system-packages -q -U huggingface_hub 2>&1 | tail -5 || "
+            "python3 -m pip install --break-system-packages -q -U huggingface_hub 2>&1 | tail -5; }"
+        )
+        lines.append(_install_hf_cmd)
         if req.disable_hf_transfer:
             lines.append("export HF_HUB_ENABLE_HF_TRANSFER=0")
             lines.append("export HF_HUB_DOWNLOAD_MAX_WORKERS=4")
         else:
-            lines.append("python3 -c 'import hf_transfer' 2>/dev/null || python3 -m pip install --user --break-system-packages -q hf_transfer 2>/dev/null || python3 -m pip install -q hf_transfer 2>/dev/null")
+            _install_hft_cmd = (
+                "python3 -c 'import hf_transfer' 2>/dev/null || "
+                "{ [ -n \"${VIRTUAL_ENV:-}${CONDA_PREFIX:-}\" ] && "
+                "python3 -m pip install -q hf_transfer 2>&1 | tail -5 || "
+                "python3 -m pip install --user --break-system-packages -q hf_transfer 2>&1 | tail -5 || "
+                "python3 -m pip install --break-system-packages -q hf_transfer 2>&1 | tail -5; }"
+            )
+            lines.append(_install_hft_cmd)
             lines.append("python3 -c 'import hf_transfer' 2>/dev/null && export HF_HUB_ENABLE_HF_TRANSFER=1")
             lines.append("export HF_HUB_DOWNLOAD_MAX_WORKERS=8")
 
@@ -533,8 +552,23 @@ def setup_cookbook_routes() -> APIRouter:
             runner_lines.append('export PATH="$HOME/.local/bin:$PATH"')
             # Install hf CLI + hf_transfer best-effort so future runs get the fast path.
             # Use --break-system-packages on PEP-668 systems (Arch, newer Debian) so it doesn't bail.
-            runner_lines.append("command -v hf >/dev/null 2>&1 || pip install --user --break-system-packages -q -U huggingface_hub 2>/dev/null || pip install -q -U huggingface_hub 2>/dev/null")
-            runner_lines.append("python3 -c 'import hf_transfer' 2>/dev/null || pip install --user --break-system-packages -q hf_transfer 2>/dev/null || pip install -q hf_transfer 2>/dev/null")
+            # In a venv, `pip install --user` errors with "User site-packages are not visible in
+            # this virtualenv" — so try plain install first, only reach for --user outside a venv.
+            # Surface the last 5 lines of any failure so the user can debug from the tmux log (#354).
+            runner_lines.append(
+                "command -v hf >/dev/null 2>&1 || "
+                "{ [ -n \"${VIRTUAL_ENV:-}${CONDA_PREFIX:-}\" ] && "
+                "pip install -q -U huggingface_hub 2>&1 | tail -5 || "
+                "pip install --user --break-system-packages -q -U huggingface_hub 2>&1 | tail -5 || "
+                "pip install --break-system-packages -q -U huggingface_hub 2>&1 | tail -5; }"
+            )
+            runner_lines.append(
+                "python3 -c 'import hf_transfer' 2>/dev/null || "
+                "{ [ -n \"${VIRTUAL_ENV:-}${CONDA_PREFIX:-}\" ] && "
+                "pip install -q hf_transfer 2>&1 | tail -5 || "
+                "pip install --user --break-system-packages -q hf_transfer 2>&1 | tail -5 || "
+                "pip install --break-system-packages -q hf_transfer 2>&1 | tail -5; }"
+            )
             runner_lines.append("python3 -c 'import hf_transfer' 2>/dev/null && export HF_HUB_ENABLE_HF_TRANSFER=1")
             runner_lines.append("export HF_HUB_DOWNLOAD_MAX_WORKERS=8")
             # Surface whether the HF token actually reached THIS server, so a gated
