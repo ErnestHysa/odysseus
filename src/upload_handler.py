@@ -6,6 +6,8 @@ import uuid
 import time
 import hashlib
 import mimetypes
+import shutil
+import tempfile
 import threading
 from datetime import datetime, timedelta
 from typing import Dict, Any, Optional
@@ -52,6 +54,10 @@ class UploadHandler:
         self._upload_rate_lock = threading.Lock()
         self._upload_rate_counter = 0
         self._upload_rate_max_entries = 1000
+        # Serialise the read-modify-write of uploads.json. Holds only
+        # for the in-process FastAPI worker; cross-process safety is
+        # provided by the atomic-rename write below.
+        self._index_lock = threading.Lock()
         
         # Create upload directory
         os.makedirs(self.upload_dir, exist_ok=True)
@@ -247,17 +253,52 @@ class UploadHandler:
         except Exception:
             return False
 
+    def _atomic_write_json(self, path: str, data: dict) -> None:
+        """Write `data` to `path` atomically: write to a temp file in the
+        same directory, then `os.replace` onto the target. The kernel
+        guarantees `os.replace` is atomic on POSIX, so a reader either
+        sees the old contents or the new contents, never a half-written
+        file. Also keeps a `.bak` sibling of the previous good state.
+        """
+        directory = os.path.dirname(path) or "."
+        fd, tmp = tempfile.mkstemp(prefix=".uploads-", suffix=".tmp", dir=directory)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            if os.path.exists(path):
+                bak = path + ".bak"
+                try:
+                    shutil.copy2(path, bak)
+                except OSError:
+                    pass
+            os.replace(tmp, path)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+
     def _load_upload_index(self) -> Dict[str, Any]:
         uploads_db_path = os.path.join(self.upload_dir, "uploads.json")
         if not os.path.exists(uploads_db_path):
             return {}
-        try:
-            with open(uploads_db_path, "r") as f:
-                data = json.load(f)
-            return data if isinstance(data, dict) else {}
-        except Exception as e:
-            logger.warning(f"Failed to read uploads database: {e}")
-            return {}
+        # Try the live file first, fall back to the .bak sibling if the
+        # live file is truncated/corrupted (e.g. a previous writer was
+        # SIGKILL'd mid-rename before the new code path was deployed).
+        for candidate in (uploads_db_path, uploads_db_path + ".bak"):
+            if not os.path.exists(candidate):
+                continue
+            try:
+                with open(candidate, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                return data if isinstance(data, dict) else {}
+            except Exception as e:
+                logger.warning(f"Failed to read uploads database ({candidate}): {e}")
+                continue
+        return {}
 
     def get_upload_info(self, upload_id: str) -> Optional[Dict[str, Any]]:
         """Return the uploads.json metadata row for an upload ID, if present."""
@@ -484,12 +525,12 @@ class UploadHandler:
             
             existing_file["last_accessed"] = datetime.now().isoformat()
             existing_files[existing_key] = existing_file
-            
-            try:
-                with open(uploads_db_path, "w", encoding="utf-8") as f:
-                    json.dump(existing_files, f, indent=2)
-            except Exception as e:
-                logger.warning(f"Failed to update uploads database: {e}")
+
+            with self._index_lock:
+                try:
+                    self._atomic_write_json(uploads_db_path, existing_files)
+                except Exception as e:
+                    logger.warning(f"Failed to update uploads database: {e}")
             
             return {
                 "id": existing_file["id"],
@@ -548,24 +589,14 @@ class UploadHandler:
                 logger.warning(f"Failed to read image dimensions for {file_id}: {e}")
         
         # Update uploads database
-        try:
-            if os.path.exists(uploads_db_path):
-                try:
-                    with open(uploads_db_path, "r", encoding="utf-8") as f:
-                        all_files = json.load(f)
-                except Exception:
-                    all_files = {}
-            else:
-                all_files = {}
-            
-            storage_key = f"{owner}:{file_hash}" if owner else file_hash
-            all_files[storage_key] = file_metadata
-            
-            with open(uploads_db_path, "w", encoding="utf-8") as f:
-                json.dump(all_files, f, indent=2)
-                
-        except Exception as e:
-            logger.warning(f"Failed to update uploads database: {e}")
+        with self._index_lock:
+            try:
+                current = self._load_upload_index() if os.path.exists(uploads_db_path) else {}
+                storage_key = f"{owner}:{file_hash}" if owner else file_hash
+                current[storage_key] = file_metadata
+                self._atomic_write_json(uploads_db_path, current)
+            except Exception as e:
+                logger.warning(f"Failed to update uploads database: {e}")
         
         logger.info(f"File uploaded successfully: {original_filename} ({file_size} bytes)")
         return file_metadata
