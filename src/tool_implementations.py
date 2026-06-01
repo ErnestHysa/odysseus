@@ -1068,6 +1068,118 @@ async def do_manage_endpoints(content: str, owner: Optional[str] = None) -> Dict
 # MCP server management tool
 # ---------------------------------------------------------------------------
 
+# Allowlist of executables that may be spawned for stdio MCP servers. Anything
+# not on this list, or any absolute path that resolves outside the project
+# root, is rejected by _validate_mcp_command before the subprocess is spawned.
+# This blocks the manage_mcp-RCE pattern where the LLM/UI could pass an
+# arbitrary `command` (e.g. "sh") and `args` (e.g. ["-c", "id"]) and get
+# arbitrary code execution as the app's UID.
+import pathlib
+_MCP_ALLOWED_COMMANDS = frozenset({
+    "python3", "python", "node", "deno", "bun",
+    "uv", "uvx", "pipx",
+    "npm", "npx", "pnpm", "yarn",
+})
+# env var names that a child process must NOT be allowed to override. Allowing
+# any of these would let a poisoned env entry redirect the interpreter's
+# module search, preload a shared library, or change which executable `bash`
+# resolves to.
+_MCP_FORBIDDEN_ENV_KEYS = frozenset({
+    k.lower() for k in (
+        "LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT",
+        "PATH", "PYTHONPATH", "PYTHONSTARTUP", "PYTHONHOME",
+        "NODE_PATH", "NODE_OPTIONS", "NPM_CONFIG_GLOBALCONFIG",
+        "DYLD_INSERT_LIBRARIES", "DYLD_LIBRARY_PATH",
+    )
+})
+# args[0] patterns that turn an interpreter into a one-shot shell. Refused
+# when the resolved command is one of the interpreters above, because they
+# can execute attacker-controlled strings the same way `sh -c` does.
+_MCP_INTERPRETER_SHELL_ESCAPE_FLAGS = frozenset({
+    "-c", "-e", "--eval", "-r", "-e=", "--eval=", "-r=",
+    "/c",  # Windows cmd
+})
+
+
+def _validate_mcp_command(command: str, cmd_args, env) -> Optional[str]:
+    """Return None if command/args/env are safe to spawn, else an error string.
+
+    Checks:
+      1. `command` is a non-empty string.
+      2. `command` is either an allowlisted basename OR an absolute path that
+         resolves to a regular file inside the project root.
+      3. No arg is `None` or non-string.
+      4. None of the args is a shell-escape flag (-c, -e, ...) for the
+         allowlisted interpreters.
+      5. `env` is a flat dict[str, str] (no nesting, no non-str values) and
+         contains no forbidden keys (LD_PRELOAD, PATH, etc.).
+    """
+    if not isinstance(command, str) or not command.strip():
+        return "command must be a non-empty string"
+    cmd = command.strip()
+
+    # Resolve to a path: if it contains a path separator, treat as absolute
+    # or relative path; else treat as a bare command name to be looked up
+    # in the allowlist.
+    is_path = (os.sep in cmd) or ("/" in cmd) or (os.altsep and os.altsep in cmd)
+    if is_path:
+        try:
+            resolved = pathlib.Path(cmd).expanduser().resolve(strict=False)
+        except (OSError, RuntimeError) as e:
+            return f"command path could not be resolved: {e}"
+        # Must be a file inside the project root (i.e. relative to the
+        # odysseus repo, not /usr/bin or /tmp/evil.sh).
+        project_root = pathlib.Path(__file__).resolve().parent.parent
+        try:
+            resolved.relative_to(project_root)
+        except ValueError:
+            return (f"command path '{cmd}' is outside the project root; "
+                    f"only allowlisted executables (e.g. python3, node) or "
+                    f"paths inside {project_root} are permitted")
+        if not resolved.is_file():
+            return f"command path '{cmd}' is not a regular file"
+    else:
+        basename = os.path.basename(cmd)
+        if basename not in _MCP_ALLOWED_COMMANDS:
+            return (f"command '{basename}' is not on the MCP allowlist; "
+                    f"permitted: {sorted(_MCP_ALLOWED_COMMANDS)}")
+
+    # Args: must be a flat list/tuple of strings; no shell-escape flags for
+    # the allowlisted interpreters (they turn "python3 -c '...'" into a
+    # one-shot shell, which is exactly the RCE we are closing).
+    if cmd_args is None:
+        cmd_args = []
+    if not isinstance(cmd_args, (list, tuple)):
+        return "args must be a list of strings"
+    for i, a in enumerate(cmd_args):
+        if not isinstance(a, str):
+            return f"args[{i}] must be a string (got {type(a).__name__})"
+    if is_path or os.path.basename(cmd) in _MCP_ALLOWED_COMMANDS:
+        # Only enforce on interpreter-style commands; for project-relative
+        # scripts the caller already controls what gets executed.
+        if any(a in _MCP_INTERPRETER_SHELL_ESCAPE_FLAGS for a in cmd_args):
+            return (f"args contain a shell-escape flag "
+                    f"({sorted(_MCP_INTERPRETER_SHELL_ESCAPE_FLAGS)}); "
+                    f"these are not allowed for stdio MCP servers because "
+                    f"they turn the interpreter into a one-shot shell")
+
+    # Env: must be a flat dict of str->str; no forbidden keys.
+    if env is None:
+        env = {}
+    if not isinstance(env, dict):
+        return "env must be a flat dict of string keys to string values"
+    for k, v in env.items():
+        if not isinstance(k, str) or not isinstance(v, str):
+            return f"env entries must be string→string (got {type(k).__name__}→{type(v).__name__})"
+    forbidden_present = [k for k in env if k.lower() in _MCP_FORBIDDEN_ENV_KEYS]
+    if forbidden_present:
+        return (f"env contains forbidden keys: {sorted(forbidden_present)}; "
+                f"these would let the child override loader paths, the "
+                f"interpreter, or the executable search path")
+
+    return None
+
+
 async def do_manage_mcp(content: str, owner: Optional[str] = None) -> Dict:
     """Manage MCP servers: list, add, delete, enable, disable, reconnect."""
     try:
@@ -1107,6 +1219,13 @@ async def do_manage_mcp(content: str, owner: Optional[str] = None) -> Dict:
         env = args.get("env", {})
         if not name or not command:
             return {"error": "name and command are required", "exit_code": 1}
+        # SECURITY: validate command/args/env against the MCP allowlist before
+        # any DB write or subprocess spawn. Without this, a prompt-injection
+        # payload could register `command=sh, args=["-c", "..."]` and get RCE.
+        validation_err = _validate_mcp_command(command, cmd_args, env)
+        if validation_err is not None:
+            logger.warning(f"manage_mcp 'add' rejected for {name!r}: {validation_err}")
+            return {"error": validation_err, "exit_code": 1}
         sid = str(_uuid.uuid4())[:8]
         db = SessionLocal()
         try:
