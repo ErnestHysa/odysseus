@@ -744,10 +744,14 @@ import createResearchSynapse from './researchSynapse.js';
       fd.append('message', _finalMsgWithInject);
       fd.append('session', streamSessionId);
       if (ids.length) fd.append('attachments', JSON.stringify(ids));
-      // Auto-save & send active doc ID so the backend sees latest content
+      // Auto-save & send active doc ID so the backend sees latest content.
+      // Always send the field — when the panel is closed the empty value tells
+      // the backend to skip session/in-memory fallbacks (#1160).
       if (documentModule && documentModule.isPanelOpen() && documentModule.getCurrentDocId()) {
         try { await documentModule.saveDocument({ silent: true }); } catch (_e) { /* best-effort */ }
         fd.append('active_doc_id', documentModule.getCurrentDocId());
+      } else {
+        fd.append('active_doc_id', '');
       }
       // Web toggle: pre-search in Chat mode, tool permission in Agent mode
       const toggleState = Storage.loadToggleState();
