@@ -54,9 +54,12 @@ class UploadHandler:
         self._upload_rate_lock = threading.Lock()
         self._upload_rate_counter = 0
         self._upload_rate_max_entries = 1000
-        # Serialise the read-modify-write of uploads.json. Holds only
-        # for the in-process FastAPI worker; cross-process safety is
-        # provided by the atomic-rename write below.
+        # Serialise the read-modify-write of uploads.json within one
+        # Python process. Scope: single FastAPI worker (the default
+        # uvicorn deployment). Cross-process / multi-worker deployments
+        # need an additional file-level lock (flock) or a database;
+        # the atomic-rename write below keeps on-disk state consistent
+        # on its own but does not serialise writers across processes.
         self._index_lock = threading.Lock()
         
         # Create upload directory
@@ -499,52 +502,64 @@ class UploadHandler:
         # Calculate file hash for deduplication
         file_hash = self.calculate_file_hash(file_obj)
         
-        # Check for duplicate files
+        # Check for duplicate files.
+        # The duplicate-detection lookup AND the write must both happen
+        # under _index_lock: a duplicate upload racing with a new-entry
+        # insert must not overwrite a newer snapshot of the index with
+        # the stale one read before the insert.
         uploads_db_path = os.path.join(self.upload_dir, "uploads.json")
-        existing_files = {}
-        
-        if os.path.exists(uploads_db_path):
-            try:
-                with open(uploads_db_path, "r", encoding="utf-8") as f:
-                    existing_files = json.load(f)
-            except Exception as e:
-                logger.warning(f"Failed to read uploads database: {e}")
-        
-        # Check if this hash already exists for the same owner. Uploads are
-        # access-controlled by owner, so cross-user dedupe must not return a
-        # shared file ID.
-        existing_key = None
         existing_file = None
-        for key, info in existing_files.items():
-            if info.get("hash") == file_hash and info.get("owner") == owner:
-                existing_key = key
-                existing_file = info
-                break
+        existing_key = None
+        with self._index_lock:
+            existing_files = self._load_upload_index()
+            for key, info in existing_files.items():
+                if info.get("hash") == file_hash and info.get("owner") == owner:
+                    existing_key = key
+                    existing_file = info
+                    break
         if existing_file:
             logger.info(f"Duplicate file upload detected: {original_filename} -> {existing_file['id']}")
-            
-            existing_file["last_accessed"] = datetime.now().isoformat()
-            existing_files[existing_key] = existing_file
 
+            existing_file["last_accessed"] = datetime.now().isoformat()
             with self._index_lock:
                 try:
-                    self._atomic_write_json(uploads_db_path, existing_files)
+                    current = self._load_upload_index()
+                    # Re-resolve the key inside the lock: a concurrent
+                    # insert can have changed the dict's keys.
+                    live_key = existing_key
+                    if live_key not in current:
+                        for k, v in current.items():
+                            if v.get("hash") == file_hash and v.get("owner") == owner:
+                                live_key = k
+                                existing_file = v
+                                break
+                    if live_key is None:
+                        # No matching entry anymore (e.g. cleaned up between
+                        # the outer read and the write). Fall through to the
+                        # fresh-insert path below; release the lock first.
+                        raise LookupError("upload entry vanished mid-dedupe")
+                    existing_file["last_accessed"] = datetime.now().isoformat()
+                    current[live_key] = existing_file
+                    self._atomic_write_json(uploads_db_path, current)
+                except LookupError:
+                    existing_file = None
                 except Exception as e:
                     logger.warning(f"Failed to update uploads database: {e}")
-            
-            return {
-                "id": existing_file["id"],
-                "path": existing_file["path"],
-                "mime": existing_file["mime"],
-                "size": existing_file["size"],
-                "name": existing_file["original_name"],
-                "hash": file_hash,
-                "uploaded_at": existing_file["uploaded_at"],
-                "owner": existing_file.get("owner"),
-                "width": existing_file.get("width"),
-                "height": existing_file.get("height"),
-                "is_duplicate": True
-            }
+
+            if existing_file:
+                return {
+                    "id": existing_file["id"],
+                    "path": existing_file["path"],
+                    "mime": existing_file["mime"],
+                    "size": existing_file["size"],
+                    "name": existing_file["original_name"],
+                    "hash": file_hash,
+                    "uploaded_at": existing_file["uploaded_at"],
+                    "owner": existing_file.get("owner"),
+                    "width": existing_file.get("width"),
+                    "height": existing_file.get("height"),
+                    "is_duplicate": True
+                }
         
         # Generate unique ID and determine save location
         _, ext = os.path.splitext(safe_filename)
