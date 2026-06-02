@@ -21,6 +21,7 @@ import * as emailInbox from './emailInbox.js';
 import codeRunnerModule from './codeRunner.js';
 import slashCommands, { initSlashCommands, isCommand, handleSlashCommand, handleSetupInput, handleSetupWizard, typewriterInto } from './slashCommands.js';
 import createResearchSynapse from './researchSynapse.js';
+import { computeDeleteTargets } from './chatDeleteTargets.js';
   const RESEARCH_TIMEOUT_MS = 360000;
   const DEFAULT_TIMEOUT_MS = 120000;
   const RESEARCH_SVG = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></svg>';
@@ -4037,61 +4038,29 @@ import createResearchSynapse from './researchSynapse.js';
     const clickedIndex = allMsgs.indexOf(msgElement);
     if (clickedIndex < 0) return;
 
+    // sessionId can be null when the chat is showing client-side-only bubbles
+    // (e.g. the "No chat session active" error shown when no model is picked).
+    // Those bubbles carry no dbId, so the fallback at the bottom of this
+    // function handles the DOM-only delete.
     const sessionId = sessionModule.getCurrentSessionId();
-    if (!sessionId) return;
 
-    const clickedIsUser = msgElement.classList.contains('msg-user');
+    // Find the user+AI pair. Pure helper, unit-tested in tests/test_chat_delete_message_no_session.py.
+    const targets = computeDeleteTargets(allMsgs, clickedIndex);
+    if (!targets) return;
+    const { userIndex, aiIndex, msgIds } = targets;
 
-    // Find the user+AI pair
-    let userIndex = -1;
-    let aiIndex = -1;
-    if (clickedIsUser) {
-      userIndex = clickedIndex;
-      // Find the following AI message
-      for (let i = clickedIndex + 1; i < allMsgs.length; i++) {
-        if (allMsgs[i].classList.contains('msg-ai') && !allMsgs[i].classList.contains('msg-continuation')) {
-          aiIndex = i;
-          break;
-        }
-        if (allMsgs[i].classList.contains('msg-user')) break; // next user msg, no AI response
-      }
-    } else {
-      // If clicked on a continuation, walk back to the main AI message
-      let mainAiIndex = clickedIndex;
-      if (allMsgs[mainAiIndex].classList.contains('msg-continuation')) {
-        for (let i = mainAiIndex - 1; i >= 0; i--) {
-          if (allMsgs[i].classList.contains('msg-ai') && !allMsgs[i].classList.contains('msg-continuation')) {
-            mainAiIndex = i;
-            break;
-          }
-        }
-      }
-      aiIndex = mainAiIndex;
-      // Find the preceding user message
-      for (let i = aiIndex - 1; i >= 0; i--) {
-        if (allMsgs[i].classList.contains('msg-user')) {
-          userIndex = i;
-          break;
-        }
-      }
-    }
-
-    // Collect DB message IDs and DOM elements to remove
-    const msgIds = [];
+    // Collect DOM elements to remove (between the user+AI pair, continuations, tool bubbles).
+    // msgIds was already populated by the helper for any bubble that has a dbId.
     const domToRemove = [];
 
     // Add the user message if found
     if (userIndex >= 0) {
       domToRemove.push(allMsgs[userIndex]);
-      const uid = allMsgs[userIndex].dataset.dbId;
-      if (uid) msgIds.push(uid);
     }
 
     // Add the AI message if found
     if (aiIndex >= 0) {
       domToRemove.push(allMsgs[aiIndex]);
-      const aid = allMsgs[aiIndex].dataset.dbId;
-      if (aid) msgIds.push(aid);
 
       const aiEl = allMsgs[aiIndex];
       // Also remove agent-thread elements BETWEEN user and AI
