@@ -1,6 +1,7 @@
 """Calendar routes — local SQLite-backed calendar CRUD."""
 
 import logging
+import re
 import uuid
 from datetime import datetime, date, timedelta
 from typing import Optional, List
@@ -506,6 +507,7 @@ def _expand_rrule(
     results = []
     base = _event_to_dict(ev)
 
+    _MAX_OCCURRENCES = 1000
     for occ_start in occurrences:
         occ_end = occ_start + duration
 
@@ -536,6 +538,8 @@ def _expand_rrule(
             d["is_utc"] = bool(getattr(ev, "is_utc", False))
 
         results.append(d)
+        if len(results) >= _MAX_OCCURRENCES:
+            break
 
     return results
 
@@ -1168,7 +1172,7 @@ def setup_calendar_routes() -> APIRouter:
             lines.append("END:VCALENDAR")
 
             ics_data = "\r\n".join(lines)
-            safe_name = cal.name.replace(" ", "_").replace("/", "_")
+            safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", cal.name or "calendar")
             return Response(
                 content=ics_data,
                 media_type="text/calendar",
